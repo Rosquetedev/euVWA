@@ -88,10 +88,14 @@ jobs:
             org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
 
       - name: Verificar que el contenedor corre como no-root
-        run: |
-          docker run --rm ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} whoami | grep -v root || \
-            (echo " ERROR: Contenedor ejecutándose como root" && exit 1)
-          echo " Contenedor corre como usuario no-root"
+  run: |
+    USER_IN_CONTAINER=$(docker run --rm ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} whoami 2>&1)
+    echo "Usuario en contenedor: $USER_IN_CONTAINER"
+    if [ "$USER_IN_CONTAINER" = "root" ]; then
+      echo "ERROR: Contenedor ejecutandose como root"
+      exit 1
+    fi
+    echo "OK: Contenedor corre como $USER_IN_CONTAINER"
 
   
   # JOB 3: Generación de SBOM
