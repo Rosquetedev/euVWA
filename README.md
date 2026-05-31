@@ -182,8 +182,8 @@ ignore-unfixed: true  # Solo reporta CVEs con parche disponible
 **Umbral de severidad:** Se bloqueará el pipeline ante cualquier CVE de severidad CRITICAL o HIGH que tenga fix disponible. CVEs MEDIUM y LOW generan advertencia pero no bloquean.
 
 **Comportamiento por rama:**
-- `main-vulnerable`: ❌ Falla por CVEs en dependencias vulnerables
-- `main-secure`: ✅ Pasa porque las dependencias están actualizadas
+- `main-vulnerable`: Falla por CVEs en dependencias vulnerables
+- `main-secure`: Pasa porque las dependencias están actualizadas
 
 ---
 
@@ -319,8 +319,8 @@ res.json(users); // Devuelve TODO
 
 | Rama | Pipeline | Resultado | Motivo |
 |------|----------|-----------|--------|
-| `main-vulnerable` | `pipeline-vulnerable.yml` | ❌ **FALLA** | Trivy detecta CVEs CRITICAL/HIGH en dependencias desactualizadas. Semgrep detecta patrones de inyección. |
-| `main-secure` | `pipeline-secure.yml` | ✅ **PASA** | Dependencias actualizadas, código sanitizado, imagen hardened. Sin CVEs con fix disponible. |
+| `main-vulnerable` | `pipeline-vulnerable.yml` | **FALLA** | Trivy detecta CVEs CRITICAL/HIGH en dependencias desactualizadas. Semgrep detecta patrones de inyección. |
+| `main-secure` | `pipeline-secure.yml` | **PASA** | Dependencias actualizadas, código sanitizado, imagen hardened. Sin CVEs con fix disponible. |
 
 ---
 
