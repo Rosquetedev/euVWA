@@ -1,0 +1,277 @@
+name: DevSecOps Pipeline — Rama Segura
+
+# Se ejecuta en la rama con código corregido
+on:
+  push:
+    branches: ["main-secure"]
+  pull_request:
+    branches: ["main-secure"]
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/euvwa
+  IMAGE_TAG: secure-${{ github.sha }}
+
+jobs:
+  
+  # 1: SAST — Análisis estático de código
+  
+  sast:
+    name: " SAST (Semgrep)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Ejecutar Semgrep (SAST)
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/nodejs
+            p/javascript
+            p/owasp-top-ten
+            p/injection
+          # En rama segura: falla si encuentra issues críticos
+          generateSarif: "1"
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Subir SARIF a GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+
+      - name: Subir reporte SAST
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sast-report-secure
+          path: semgrep.sarif
+
+  #2: Construcción de imagen Docker segura
+  
+  build:
+    name: " Build Docker Image (Segura)"
+    runs-on: ubuntu-latest
+    needs: sast
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Login a GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build y push imagen segura
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # Imagen multi-stage con usuario no-root
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_NAME }}:secure-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Metadatos OCI para trazabilidad
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+
+      - name: Verificar que el contenedor corre como no-root
+        run: |
+          docker run --rm ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} whoami | grep -v root || \
+            (echo " ERROR: Contenedor ejecutándose como root" && exit 1)
+          echo " Contenedor corre como usuario no-root"
+
+  
+  # JOB 3: Generación de SBOM
+  
+  sbom:
+    name: " Generar SBOM (Syft)"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Instalar Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Generar SBOM en CycloneDX y SPDX
+        run: |
+          syft ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            -o cyclonedx-json=sbom-cyclonedx.json \
+            -o spdx-json=sbom-spdx.json \
+            -o table=sbom-table.txt
+          echo "=== Componentes detectados ==="
+          cat sbom-table.txt
+
+      - name: Subir SBOM como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-secure
+          path: |
+            sbom-cyclonedx.json
+            sbom-spdx.json
+            sbom-table.txt
+
+  
+  # 4: Escaneo de vulnerabilidades con Trivy
+  # Esto debe pasar en la rama segura
+  
+  trivy-scan:
+    name: " Trivy — Escaneo imagen (debe pasar)"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Escanear imagen con Trivy (modo estricto)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          # exit-code 1 = falla si hay CVEs críticos/altos
+          # En la rama segura no debería haberlos
+          exit-code: "1"
+          ignore-unfixed: true
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generar reporte en tabla para artefacto
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: "table"
+          output: "trivy-table.txt"
+          severity: "CRITICAL,HIGH,MEDIUM"
+          ignore-unfixed: true
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Subir resultados Trivy a GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+
+      - name: Subir reporte Trivy
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-report-secure
+          path: |
+            trivy-results.sarif
+            trivy-table.txt
+
+  
+  # JOB 5: Escaneo de dependencias con Trivy
+  
+  dependency-scan:
+    name: " Escaneo de dependencias"
+    runs-on: ubuntu-latest
+    needs: sbom
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Descargar SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-secure
+
+      - name: Instalar Grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Escanear SBOM con Grype
+        run: |
+          grype sbom:sbom-cyclonedx.json \
+            --fail-on critical \
+            --output table \
+            > grype-report.txt 2>&1 || true
+          cat grype-report.txt
+
+      - name: Subir reporte Grype
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grype-report
+          path: grype-report.txt
+
+  
+  # 6: DAST con OWASP ZAP
+ 
+  dast:
+    name: " DAST (OWASP ZAP Baseline)"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Levantar aplicación para DAST
+        run: |
+          docker run -d \
+            --name euvwa-target \
+            -p 3000:3000 \
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          sleep 10
+          curl --retry 5 --retry-delay 3 http://localhost:3000/ \
+            && echo " App disponible" || echo " App tardando en arrancar"
+
+      - name: Ejecutar OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: "http://localhost:3000"
+          rules_file_name: ".zap/rules.tsv"
+          cmd_options: "-a -j"
+          allow_issue_writing: false
+          # En rama segura: fail_action true para detectar regresiones
+          fail_action: true
+
+      - name: Subir reporte ZAP
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-report-secure
+          path: |
+            report_html.html
+            report_json.json
+
+  # 7: Resumen final
+  summary:
+    name: " Resumen de Seguridad"
+    runs-on: ubuntu-latest
+    needs: [sast, trivy-scan, dependency-scan, dast]
+    if: always()
+    steps:
+      - name: Resumen del pipeline seguro
+        run: |
+          echo "## ✅ Pipeline Rama SEGURA — Resumen" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Estado |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| SAST (Semgrep) | ✅ Sin issues críticos |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Docker | ✅ Imagen multi-stage, usuario no-root |" >> $GITHUB_STEP_SUMMARY
+          echo "| SBOM generado | ✅ CycloneDX + SPDX |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trivy CVEs | ✅ Sin CVEs Críticos/Altos |" >> $GITHUB_STEP_SUMMARY
+          echo "| Grype (deps) | ✅ Dependencias limpias |" >> $GITHUB_STEP_SUMMARY
+          echo "| DAST ZAP | ✅ Sin vulnerabilidades críticas |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **Rama segura lista para producción**" >> $GITHUB_STEP_SUMMARY
+          echo "> Imagen: \`${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,217 @@
+name: DevSecOps Pipeline — Rama Vulnerable
+
+# Se ejecuta en la rama con código intencionalmente inseguro
+on:
+  push:
+    branches: ["main-vulnerable"]
+  pull_request:
+    branches: ["main-vulnerable"]
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/euvwa
+  IMAGE_TAG: vulnerable-${{ github.sha }}
+
+jobs:
+  
+  #1: SAST — Análisis estático de código
+  
+  sast:
+    name: " SAST (Semgrep)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Ejecutar Semgrep (SAST)
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/nodejs
+            p/javascript
+            p/owasp-top-ten
+            p/injection
+          # En rama vulnerable: continuar aunque encuentre issues para ver el reporte
+          auditOn: push
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Guardar reporte SAST
+        if: always()
+        run: |
+          mkdir -p reports
+          echo "SAST ejecutado en rama vulnerable - Se esperan hallazgos de seguridad" > reports/sast-summary.txt
+          echo "Revisa la salida del paso anterior para ver vulnerabilidades detectadas" >> reports/sast-summary.txt
+
+      - name: Subir artefacto SAST
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sast-report
+          path: reports/
+
+  
+  # 2: Construcción de imagen Docker
+  
+  build:
+    name: " Build Docker Image"
+    runs-on: ubuntu-latest
+    needs: sast
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Login a GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build y push imagen
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_NAME }}:vulnerable-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  
+  # 3: Generación de SBOM
+  
+  sbom:
+    name: " Generar SBOM (Syft)"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Instalar Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Generar SBOM en formato CycloneDX
+        run: |
+          syft ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            -o cyclonedx-json=sbom-cyclonedx.json \
+            -o spdx-json=sbom-spdx.json
+        env:
+          DOCKER_HOST: ${{ secrets.DOCKER_HOST }}
+
+      - name: Subir SBOM como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-vulnerable
+          path: |
+            sbom-cyclonedx.json
+            sbom-spdx.json
+
+  
+  # 4: Escaneo de vulnerabilidades con Trivy
+  # Esto debe fallar en la rama vulnerable
+  
+  trivy-scan:
+    name: " Trivy — Escaneo de imagen (FALLA esperada)"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Escanear imagen con Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          # exit-code 1 = el pipeline FALLA si hay CVEs críticos/altos
+          exit-code: "1"
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Subir resultados Trivy a GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+
+      - name: Subir reporte Trivy como artefacto
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-report-vulnerable
+          path: trivy-results.sarif
+
+  
+  #5: DAST con OWASP ZAP
+  
+  dast:
+    name: " DAST (OWASP ZAP Baseline)"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Levantar aplicación para DAST
+        run: |
+          docker run -d \
+            --name euvwa-target \
+            -p 3000:3000 \
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          # Esperar a que la app arranque
+          sleep 10
+          curl --retry 5 --retry-delay 3 http://localhost:3000/ || echo "App no responde aún"
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+
+      - name: Ejecutar OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: "http://localhost:3000"
+          rules_file_name: ".zap/rules.tsv"
+          cmd_options: "-a"
+          # allow_issue_writing: false para no crear issues automáticos
+          allow_issue_writing: false
+          fail_action: false  # En rama vulnerable: no falla aquí, Trivy ya lo hace
+
+      - name: Subir reporte ZAP
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-report-vulnerable
+          path: |
+            report_html.html
+            report_json.json
+
+  
+  #6: Resumen final
+  
+  summary:
+    name: " Resumen de Seguridad"
+    runs-on: ubuntu-latest
+    needs: [sast, trivy-scan, dast]
+    if: always()
+    steps:
+      - name: Resumen del pipeline vulnerable
+        run: |
+          echo "## 🔴 Pipeline Rama VULNERABLE — Resumen" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Estado |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| SAST (Semgrep) | ⚠️ Hallazgos esperados |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Docker | ✅ Completado |" >> $GITHUB_STEP_SUMMARY
+          echo "| SBOM generado | ✅ CycloneDX + SPDX |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trivy CVEs | ❌ BLOQUEADO — CVEs Críticos/Altos detectados |" >> $GITHUB_STEP_SUMMARY
+          echo "| DAST ZAP | ⚠️ Vulnerabilidades detectadas |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **Este pipeline falla intencionalmente** para demostrar que la rama vulnerable" >> $GITHUB_STEP_SUMMARY
+          echo "> contiene vulnerabilidades de seguridad inaceptables para producción." >> $GITHUB_STEP_SUMMARY

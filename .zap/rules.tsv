@@ -1,0 +1,12 @@
+# ZAP Baseline Rules - euVWA
+# Formato: ID	ALERT_ACTION	[PARAMETER]
+# ACTIONS: IGNORE / WARN / FAIL
+
+# Ignorar avisos de cookies sin Secure flag (app de lab sin HTTPS)
+10010	IGNORE
+# Ignorar CSP header missing en versión vulnerable (esperado)
+10038	WARN
+# X-Content-Type-Options missing — advertencia
+10021	WARN
+# Server leaks version — FAIL en producción
+10036	WARN

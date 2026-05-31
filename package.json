@@ -1,0 +1,14 @@
+{
+  "name": "practica-laboratorio-seguridad",
+  "version": "2.0.0",
+  "description": "Web con vulnerabilidades y su versión segura",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "escape-html": "^1.0.3",
+    "express": "^5.2.1",
+    "sqlite3": "^6.0.1"
+  }
+}
